@@ -8,7 +8,7 @@
 
   <groupId>com.hooniegit</groupId>
   <artifactId>Xerializer</artifactId>
-  <version>0.1.0</version>
+  <version>2.0.0</version>
   <packaging>jar</packaging>
 
   <name>Xerializer</name>
@@ -40,13 +40,6 @@
       <groupId>org.apache.commons</groupId>
       <artifactId>commons-pool2</artifactId>
       <version>2.11.1</version>
-    </dependency>
-
-    <!-- Netty (optional depending on usage) -->
-    <dependency>
-      <groupId>io.netty</groupId>
-      <artifactId>netty-all</artifactId>
-      <version>4.1.115.Final</version>
     </dependency>
 
     <!-- Optional: Test -->
