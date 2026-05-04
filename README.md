@@ -9,16 +9,18 @@ Kryo 패키지 기반의 단순한 데이터 직렬화 라이브러리입니다.
 
 ### 라이브러리 사용법
 1. Pool Serializer
+
 ```java
+import com.hooniegit.Xerializer.Kryo.ApachePoolSerializer;
 import com.hooniegit.Xerializer.Kryo.PoolSerializer;
 
 SampleDataClass data = new SampleDataClass();
 
 // Serialize
-byte[] b = PoolSerializer.serialize(data);
+byte[] b = ApachePoolSerializer.serialize(data);
 
 // Deserialize
-SampleDataClass origin = PoolSerializer.deserialize(b);
+SampleDataClass origin = ApachePoolSerializer.deserialize(b);
 ```
 2. Thread Local Serializer
 ```java

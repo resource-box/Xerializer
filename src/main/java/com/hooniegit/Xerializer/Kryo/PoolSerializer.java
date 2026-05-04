@@ -1,187 +1,112 @@
 package com.hooniegit.Xerializer.Kryo;
 
 import com.esotericsoftware.kryo.Kryo;
+
 import com.hooniegit.Xerializer.Kryo.Common.KryoHolder;
-import org.apache.commons.pool2.BasePooledObjectFactory;
-import org.apache.commons.pool2.PooledObject;
-import org.apache.commons.pool2.impl.DefaultPooledObject;
-import org.apache.commons.pool2.impl.GenericObjectPool;
-import org.apache.commons.pool2.impl.GenericObjectPoolConfig;
-import java.util.Objects;
+
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Kryo 객체를 Pool로 관리하는 Pool 기반 Kryo Serializer 클래스입니다.
- * Kryo 객체는 Thread-Safe 하지 않으므로, Pool을 사용하여 여러 스레드에서 안전하게 공유할 수 있도록 합니다.
- *
- * @Warning Thread 수가 가변적인 환경에 적합합니다.
+ * Kryo 객체를 ConcurrentLinkedQueue 기반으로 관리하는 Serializer 클래스입니다. (Lock Free)
+ * Kryo 객체는 Thread-Safe 하지 않으므로, Queue 기반으로 Pool을 사용하여 여러 스레드에서 안전하게 공유할 수 있도록 합니다.
+ * 멀티스레드 환경에서 경쟁 병목을 방지합니다.
  */
 public class PoolSerializer {
 
-    private static final GenericObjectPool<KryoHolder> pool;
+    // config
+    private static final int MAX_CAPACITY = 1_024;
+    private static final int INIT_BUF = 192_000_000;
+    private static final int MAX_BUF = 192_000_000;
 
-    static {
-        int maxTotal = 10; // 최대 10개의 Kryo 객체를 풀에 유지
-        int initBuf = 1024; // KryoHolder의 Output 객체가 처음에 할당하는 버퍼 크기
-        int maxBuf = 192000000; // KryoHolder의 Output 객체가 최대 할당할 버퍼 크기 - 필요에 따라 조정 가능
+    // queue
+    private static final ConcurrentLinkedQueue<KryoHolder> pool = new ConcurrentLinkedQueue<>();
+    private static final AtomicInteger poolSize = new AtomicInteger(0);
 
-        Objects.checkIndex(0, 1); // no-op (JDK9+) - 원하면 제거 가능
-        GenericObjectPoolConfig<KryoHolder> cfg = new GenericObjectPoolConfig<>();
-        cfg.setMaxTotal(maxTotal);
-        cfg.setMinIdle(Math.min(4, maxTotal));
-        cfg.setMaxIdle(Math.min(16, maxTotal));
-        cfg.setBlockWhenExhausted(true);
+    /**
+     * 풀에서 KryoHolder 객체를 빌려옵니다. 풀이 비어있으면 새로 생성합니다.
+     */
+    private static KryoHolder obtain() {
+        KryoHolder holder = pool.poll();
+        if (holder != null) {
+            poolSize.decrementAndGet();
+        } else {
+            Kryo kryo = new Kryo();
+            // 직렬화 실패 방지를 위한 설정 추가
+            kryo.setRegistrationRequired(false); // 클래스 등록 없이 사용 가능
+            kryo.setReferences(true); // 순환 참조 지원
+            holder = new KryoHolder(kryo, INIT_BUF, MAX_BUF);
+        }
+        return holder;
+    }
 
-        pool = new GenericObjectPool<>(new BasePooledObjectFactory<>() {
-            @Override
-            public KryoHolder create() {
-                Kryo kryo = new Kryo();
-
-                // 풀링(Pooling) 환경에서는 Kryo 객체를 생성하는 스레드와, 그 객체를 빌려다 쓰는 스레드가 다를 확률이 매우 높습니다.
-                // 만약 create() 시점에 Thread.currentThread().getContextClassLoader()를 설정해 버리면,
-                // 해당 Kryo 객체를 처음 생성한 스레드의 클래스로더가 영구적으로 박제됩니다.
-
-                // 스프링 부트(Spring Boot), 톰캣(Tomcat), 스파크(Spark) 같은 복잡한 프레임워크나 WAS 환경에서는
-                // 스레드마다, 혹은 애플리케이션 모듈마다 사용하는 스레드 컨텍스트 클래스로더(TCCL)가 동적으로 변할 수 있습니다.
-
-                // 풀에 있는 Kryo가 옛날 클래스로더를 계속 쥐고 있으면
-                // Kryo 객체가 강한 참조(Strong Reference) 형태로 해당 클래스로더를 계속 참조하게 되어
-                // 메모리 누수(Memory Leak) 현상이 발생할 수 있습니다.
-
-                // Kryo 객체를 사용할 때마다 현재 실행 중인 스레드의 클래스로더로 덮어씌우는 방식으로 설정하면,
-                // Kryo가 현재 문맥(Context)에 맞는 클래스들을 정확하게 찾아내어 객체로 복원할 수 있습니다.
-
-                // kryo.setClassLoader(Thread.currentThread().getContextClassLoader()); // (사용하지 않음)
-
-                return new KryoHolder(kryo, initBuf, maxBuf);
+    /**
+     * 사용이 끝난 KryoHolder 객체를 풀에 반납합니다.
+     * @param holder 반납할 KryoHolder 객체
+     */
+    private static void free(KryoHolder holder) {
+        if (holder != null) {
+            if (poolSize.get() < MAX_CAPACITY) {
+                holder.resetForReturn();
+                pool.offer(holder);
+                poolSize.incrementAndGet();
             }
-
-            /**
-             * 풀에서 객체를 관리하기 위해 PooledObject으로 감싸는 메서드입니다.
-             * @param obj the instance to wrap
-             * @return a {@code PooledObject} wrapping the provided instance
-             */
-            @Override
-            public PooledObject<KryoHolder> wrap(KryoHolder obj) {
-                return new DefaultPooledObject<>(obj);
-            }
-
-            /**
-             * 풀에서 객체를 빌릴 때마다 호출되는 메서드입니다.
-             * @param p a {@code PooledObject} wrapping the instance to be activated
-             */
-            @Override
-            public void activateObject(PooledObject<KryoHolder> p) {
-                p.getObject().resetForBorrow();
-
-                // activate 시점에 현재 스레드의 TCCL로 보정
-                p.getObject().kryo.setClassLoader(Thread.currentThread().getContextClassLoader());
-            }
-
-            /**
-             * 풀에 객체를 반환할 때마다 호출되는 메서드입니다.
-             * @param p a {@code PooledObject} wrapping the instance to be passivated
-             */
-            @Override
-            public void passivateObject(PooledObject<KryoHolder> p) {
-                p.getObject().resetForReturn();
-            }
-
-            /**
-             * 풀에서 객체를 폐기할 때 호출되는 메서드입니다.
-             * @param p a {@code PooledObject} wrapping the instance to be destroyed
-             */
-            @Override
-            public void destroyObject(PooledObject<KryoHolder> p) {
-                // 참조를 끊거나 로깅을 넣고 싶으면 여기서
-            }
-        }, cfg);
+            // MAX_CAPACITY를 초과하면 큐에 넣지 않고 버림 (GC가 자동으로 수거)
+        }
     }
 
     /**
      * 객체를 바이트 배열로 직렬화합니다.
-     * @param object
-     * @return
-     * @param <T>
-     * @throws Exception
+     * @param object 직렬화 대상 원본 객체
+     * @return 직렬화된 바이트 배열
+     * @param <T> 원본 데이터 타입
+     * @throws Exception 예외
      */
     public static <T> byte[] serialize(T object) throws Exception {
-        KryoHolder holder = borrow();
-        boolean ok = false;
-
+        KryoHolder holder = obtain();
+        boolean success = false;
         try {
-            holder.output.setPosition(0); // 안전을 위한 권장 사항
+            holder.resetForBorrow();
+            holder.kryo.setClassLoader(Thread.currentThread().getContextClassLoader());
             holder.kryo.writeClassAndObject(holder.output, object);
-            ok = true;
-
-            return holder.output.toBytes();
+            byte[] result = holder.output.toBytes();
+            success = true;
+            return result;
         } catch (Exception e) {
             throw new RuntimeException("Serialization failed", e);
         } finally {
-            if (ok) release(holder);
-            else invalidate(holder);
+            if (success) {
+                free(holder);
+            }
+            // 실패 시 holder를 반납하지 않아 오염된 객체가 풀에 반납되는 것을 방지
         }
     }
 
     /**
      * 바이트 배열을 원본 데이터 타입으로 역직렬화합니다.
-     * @param bytes
-     * @return
-     * @param <T>
-     * @throws Exception
+     * @param bytes 역직렬화 대상 바이트 배열
+     * @return 역직렬화된 원본 객체
+     * @param <T> 원본 데이터 타입
+     * @throws Exception 예외
      */
+    @SuppressWarnings("unchecked")
     public static <T> T deserialize(byte[] bytes) throws Exception {
-        KryoHolder holder = borrow();
-        boolean ok = false;
-
+        KryoHolder holder = obtain();
+        boolean success = false;
         try {
+            holder.resetForBorrow();
+            holder.kryo.setClassLoader(Thread.currentThread().getContextClassLoader());
             holder.input.setBuffer(bytes);
-            ok = true;
-
-            return (T) holder.kryo.readClassAndObject(holder.input);
+            T result = (T) holder.kryo.readClassAndObject(holder.input);
+            success = true;
+            return result;
         } catch (Exception e) {
             throw new RuntimeException("Deserialization failed", e);
         } finally {
-            if (ok) release(holder);
-            else invalidate(holder);
+            if (success) {
+                free(holder);
+            }
+            // 실패 시 holder를 반납하지 않아 오염된 객체가 풀에 반납되는 것을 방지
         }
     }
-
-    /**
-     * KryoHolder 객체를 빌려줍니다.
-     * borrowObject() 호출 시 Output/Input 객체를 초기화합니다.
-     * @return KryoHolder 객체
-     * @throws Exception
-     */
-    public static KryoHolder borrow() throws Exception {
-        return pool.borrowObject();
-    }
-
-    /**
-     * KryoHolder 객체를 Pool에 반환합니다.
-     * borrowObject() 호출 시 Output/Input 객체를 초기화합니다.
-     * @param h
-     */
-    public static void release(KryoHolder h) {
-        if (h == null) return;
-        pool.returnObject(h);
-    }
-
-    /**
-     * KryoHolder 객체를 폐기합니다.
-     * 예외가 발생하거나 오염된 객체는 invalidateObject()로 폐기하는 것을 권장합니다.
-     * @param h
-     */
-    public static void invalidate(KryoHolder h) {
-        if (h == null) return;
-        try {
-            pool.invalidateObject(h);
-        } catch (Exception ignored) {
-            // invalidate 실패해도 어차피 해당 holder는 버림 취급
-        }
-    }
-
-    // (선택) 운영 중 상태 확인용
-    public int getNumActive() { return pool.getNumActive(); }
-    public int getNumIdle() { return pool.getNumIdle(); }
-
 }
